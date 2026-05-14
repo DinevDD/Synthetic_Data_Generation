@@ -62,7 +62,7 @@ def discover_model(log):
     print("[2] Running Inductive Miner …")
     print('='*60)
 
-    process_tree = inductive_miner.apply(log)
+    process_tree = pm4py.discover_process_tree_inductive(log, noise_threshold=0.2)
     print(f"    Process tree: {process_tree}")
 
     net, initial_marking, final_marking = pt_converter.apply(process_tree)
@@ -71,10 +71,10 @@ def discover_model(log):
     print(f"    Petri Net — arcs        : {len(net.arcs)}")
     return process_tree, net, initial_marking, final_marking
 
-
 # ══════════════════════════════════════════════
 # PART 3 – EXPORT MODELS
 # ══════════════════════════════════════════════
+#TODO: Export process tree instead of DFG
 def export_models(log, net, initial_marking, final_marking):
     print(f"\n{'='*60}")
     print("[3] Exporting models & visualisations …")

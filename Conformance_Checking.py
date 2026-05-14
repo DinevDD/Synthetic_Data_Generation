@@ -38,11 +38,8 @@ from pm4py.algo.evaluation.simplicity import algorithm as simplicity_evaluator
 # ──────────────────────────────────────────────
 CSV_LOG_PATH = "Data/data.csv"
 
-#OUTPUT_DIR   = "pm4py_outputs_inductive/conformance"   # inductive miner
-#PNML_PATH = os.path.join("pm4py_outputs_inductive/discovery", "petri_net.pnml") # inductive miner
-
-OUTPUT_DIR   = "pm4py_outputs_heuristics/conformance" # heuristics miner
-PNML_PATH = os.path.join("pm4py_outputs_heuristics/discovery", "petri_net.pnml") # heuristics miner
+OUTPUT_DIR   = "pm4py_outputs_inductive/conformance"   # inductive miner
+PNML_PATH = os.path.join("pm4py_outputs_inductive/discovery", "petri_net.pnml") # inductive miner
 
 # CSV column mapping (adjust to your column names)
 CSV_CASE_ID_COL   = "case:concept:name"
