@@ -1,47 +1,25 @@
-"""
-Process Discovery Pipeline  (run once)
-=======================================
-Steps:
-  1. Import XES log
-  2. Discover model with Inductive Miner  →  Petri Net + Process Tree
-  3. Export Petri Net (PNML), BPMN (XML), DFG (JSON + XML)
-  4. Save PNG visualisations
-"""
-
 import os
 import json
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-
 import pm4py
 from pm4py.objects.log.importer.xes import importer as xes_importer
-
-# --- Discovery
 from pm4py.algo.discovery.inductive import algorithm as inductive_miner
 from pm4py.objects.conversion.process_tree import converter as pt_converter
-
-# --- Export: Petri Net
 from pm4py.objects.petri_net.exporter import exporter as pnml_exporter
-
-# --- Export: BPMN
 from pm4py.objects.bpmn.exporter import exporter as bpmn_exporter
-
-# --- Export: DFG
 from pm4py.algo.discovery.dfg import algorithm as dfg_discovery
 from pm4py.statistics.start_activities.log import get as start_act_get
 from pm4py.statistics.end_activities.log import get as end_act_get
+from pm4py.objects.process_tree.exporter import exporter as pt_exporter
 
-# ──────────────────────────────────────────────
-# CONFIGURATION
-# ──────────────────────────────────────────────
-XES_LOG_PATH = "Data/Sepsis Cases - Event Log.xes.gz"
+
+XES_LOG_PATH = "Data/filtered_log.xes.gz"
 OUTPUT_DIR   = "pm4py_outputs_inductive/discovery"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ══════════════════════════════════════════════
-# PART 1 – IMPORT XES LOG
-# ══════════════════════════════════════════════
+#Import log
 def import_xes_log(path: str):
     print(f"\n{'='*60}")
     print(f"[1] Importing XES log: {path}")
@@ -54,15 +32,13 @@ def import_xes_log(path: str):
     return log
 
 
-# ══════════════════════════════════════════════
-# PART 2 – INDUCTIVE MINER → PETRI NET
-# ══════════════════════════════════════════════
+#Petri net conversion
 def discover_model(log):
     print(f"\n{'='*60}")
     print("[2] Running Inductive Miner …")
     print('='*60)
 
-    process_tree = pm4py.discover_process_tree_inductive(log, noise_threshold=0.2)
+    process_tree = pm4py.discover_process_tree_inductive(log) #, noise_threshold=0.2
     print(f"    Process tree: {process_tree}")
 
     net, initial_marking, final_marking = pt_converter.apply(process_tree)
@@ -71,16 +47,26 @@ def discover_model(log):
     print(f"    Petri Net — arcs        : {len(net.arcs)}")
     return process_tree, net, initial_marking, final_marking
 
-# ══════════════════════════════════════════════
-# PART 3 – EXPORT MODELS
-# ══════════════════════════════════════════════
-#TODO: Export process tree instead of DFG
-def export_models(log, net, initial_marking, final_marking):
+#Export models
+def export_models(log, process_tree, net, initial_marking, final_marking):
     print(f"\n{'='*60}")
     print("[3] Exporting models & visualisations …")
     print('='*60)
 
-    # ── 3a. Petri Net → PNML & PNG ────────────
+    #Process tree
+    pt_path = os.path.join(OUTPUT_DIR, "process_tree.ptml")
+    pt_exporter.apply(process_tree, pt_path)
+    print(f"    [✓] Process Tree (PTML) saved → {pt_path}")
+
+    pt_txt_path = os.path.join(OUTPUT_DIR, "process_tree.txt")
+    with open(pt_txt_path, "w", encoding="utf-8") as fh:
+        fh.write(str(process_tree))
+    print(f"    [✓] Process Tree (TXT)  saved → {pt_txt_path}")
+    pt_img_path = os.path.join(OUTPUT_DIR, "process_tree.png")
+    pm4py.save_vis_process_tree(process_tree, pt_img_path)
+    print(f"    [✓] Process Tree (PNG)  saved → {pt_img_path}")
+
+    #Petri net
     pnml_path = os.path.join(OUTPUT_DIR, "petri_net.pnml")
     pnml_exporter.apply(net, initial_marking, pnml_path,
                         final_marking=final_marking)
@@ -90,7 +76,7 @@ def export_models(log, net, initial_marking, final_marking):
     pm4py.save_vis_petri_net(net, initial_marking, final_marking, pn_img_path)
     print(f"    [✓] Petri Net (PNG)  saved → {pn_img_path}")
 
-    # ── 3b. BPMN → XML & PNG ──────────────────
+    #BPMN
     bpmn_path = os.path.join(OUTPUT_DIR, "process_model.bpmn")
     bpmn_graph = pm4py.convert_to_bpmn(net, initial_marking, final_marking)
     bpmn_exporter.apply(bpmn_graph, bpmn_path)
@@ -100,7 +86,7 @@ def export_models(log, net, initial_marking, final_marking):
     pm4py.save_vis_bpmn(bpmn_graph, bpmn_img_path)
     print(f"    [✓] BPMN (PNG)       saved → {bpmn_img_path}")
 
-    # ── 3c. DFG → JSON, XML & PNG ─────────────
+    #DFG
     dfg        = dfg_discovery.apply(log)
     activities = pm4py.get_event_attribute_values(log, "concept:name")
     start_acts = start_act_get.get_start_activities(log)
@@ -110,7 +96,7 @@ def export_models(log, net, initial_marking, final_marking):
     pm4py.save_vis_dfg(dfg, start_acts, end_acts, dfg_img_path)
     print(f"    [✓] DFG (PNG)        saved → {dfg_img_path}")
 
-    # JSON
+    #JSON
     dfg_json_path = os.path.join(OUTPUT_DIR, "dfg.json")
     dfg_payload = {
         "activities"      : {act: cnt for act, cnt in activities.items()},
@@ -123,7 +109,7 @@ def export_models(log, net, initial_marking, final_marking):
         json.dump(dfg_payload, fh, indent=2, ensure_ascii=False)
     print(f"    [✓] DFG (JSON)       saved → {dfg_json_path}")
 
-    # XML
+    #XML
     root     = ET.Element("directlyFollowsGraph")
     acts_el  = ET.SubElement(root, "activities")
     for act, cnt in sorted(activities.items()):
@@ -146,17 +132,15 @@ def export_models(log, net, initial_marking, final_marking):
     print(f"    [✓] DFG (XML)        saved → {dfg_xml_path}")
 
 
-# ══════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════
+
 def main():
     print("\n" + "█" * 60)
     print("  Process Discovery Pipeline")
     print("█" * 60)
 
     log = import_xes_log(XES_LOG_PATH)
-    _, net, im, fm = discover_model(log)
-    export_models(log, net, im, fm)
+    process_tree, net, im, fm = discover_model(log)
+    export_models(log, process_tree, net, im, fm)
 
     print("\n" + "█" * 60)
     print(f"  Discovery complete.  All outputs → {OUTPUT_DIR}/")

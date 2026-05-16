@@ -30,7 +30,7 @@ df_filtered = df[df["case:concept:name"].isin(valid_cases)].copy()
 
 filtered_log = pm4py.convert_to_event_log(df_filtered)
 
-pm4py.write_xes(filtered_log, "filtered_log.xes.gz")
+pm4py.write_xes(filtered_log, "Data/filtered_log.xes.gz")
 
 
 # =========================
