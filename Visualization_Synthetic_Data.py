@@ -1,29 +1,44 @@
 import os
-import pm4py
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-log = pm4py.read_xes("Data/Sepsis Cases - Event Log.xes.gz")
-df = pm4py.convert_to_dataframe(log)
+# =========================
+# 1. Load CSV event log
+# =========================
+
+df = pd.read_csv("Data/data.csv")
+
+# Rename your CSV columns to PM4Py-style names
+df = df.rename(columns={
+    "Case ID": "case:concept:name",
+    "Activity": "concept:name",
+    "Timestamp": "time:timestamp",
+    "Group": "org:group",
+    "Lifecycle": "lifecycle:transition"
+})
+
+# Make sure timestamp is datetime
 df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+
+# Sort by case and timestamp
 df = df.sort_values(["case:concept:name", "time:timestamp"])
 
 
-case_lengths = df.groupby("case:concept:name").size()
-threshold = case_lengths.quantile(0.95)
-valid_cases = case_lengths[case_lengths <= threshold].index
-df_filtered = df[df["case:concept:name"].isin(valid_cases)].copy()
-filtered_log = pm4py.convert_to_event_log(df_filtered)
-pm4py.write_xes(filtered_log, "Data/filtered_log.xes.gz")
+# =========================
+# 2. Create output folder
+# =========================
 
-
-
-output_folder = "visualizations"
+output_folder = "visualizations_synthetic"
 os.makedirs(output_folder, exist_ok=True)
 
+
+# =========================
+# 3. Case-level statistics
+# =========================
+
 case_stats = (
-    df_filtered
+    df
     .groupby("case:concept:name")
     .agg(
         start_time=("time:timestamp", "min"),
@@ -35,6 +50,11 @@ case_stats = (
 case_stats["case_duration"] = case_stats["end_time"] - case_stats["start_time"]
 case_stats["case_duration_hours"] = case_stats["case_duration"].dt.total_seconds() / 3600
 case_stats["case_duration_days"] = case_stats["case_duration_hours"] / 24
+
+
+# =========================
+# 4. Summary statistics
+# =========================
 
 summary_stats = pd.DataFrame({
     "Metric": [
@@ -51,9 +71,9 @@ summary_stats = pd.DataFrame({
         "Max case duration in hours"
     ],
     "Value": [
-        len(df_filtered),
-        df_filtered["case:concept:name"].nunique(),
-        df_filtered["concept:name"].nunique(),
+        len(df),
+        df["case:concept:name"].nunique(),
+        df["concept:name"].nunique(),
         case_stats["events_per_case"].mean(),
         case_stats["events_per_case"].median(),
         case_stats["events_per_case"].min(),
@@ -70,16 +90,13 @@ summary_stats.to_csv(
     index=False
 )
 
-print("\nSummary statistics after preprocessing:")
+print("\nSummary statistics:")
 print(summary_stats.to_string(index=False))
 
-print("\nPreprocessing summary:")
-print(f"Original number of cases: {df['case:concept:name'].nunique()}")
-print(f"Filtered number of cases: {df_filtered['case:concept:name'].nunique()}")
-print(f"Removed cases: {df['case:concept:name'].nunique() - df_filtered['case:concept:name'].nunique()}")
-print(f"95th percentile event-count threshold: {threshold}")
 
-
+# =========================
+# 5. Helper function for saving plots
+# =========================
 
 def save_plot(filename):
     path = os.path.join(output_folder, filename)
@@ -89,16 +106,23 @@ def save_plot(filename):
     print(f"Saved: {path}")
 
 
+# =========================
+# 6. Activity frequency
+# =========================
 
-activity_counts = df_filtered["concept:name"].value_counts().head(20)
+activity_counts = df["concept:name"].value_counts().head(20)
+
 plt.figure(figsize=(10, 6))
 activity_counts.sort_values().plot(kind="barh")
 plt.title("Events Distribution")
 plt.xlabel("Frequency")
 plt.ylabel("Activity")
-save_plot("top_15_most_common_events.png")
+save_plot("top_20_most_common_events.png")
 
 
+# =========================
+# 7. Box plot of case durations
+# =========================
 
 plt.figure(figsize=(8, 5))
 plt.boxplot(case_stats["case_duration_hours"], vert=False)
@@ -107,12 +131,20 @@ plt.xlabel("Case Duration in Hours")
 save_plot("boxplot_case_durations.png")
 
 
+# =========================
+# 8. Box plot of events per case
+# =========================
+
 plt.figure(figsize=(8, 5))
 plt.boxplot(case_stats["events_per_case"], vert=False)
 plt.title("Box Plot of Events per Case")
 plt.xlabel("Number of Events per Case")
 save_plot("boxplot_events_per_case.png")
 
+
+# =========================
+# 9. Histogram of case durations
+# =========================
 
 plt.figure(figsize=(8, 5))
 plt.hist(case_stats["case_duration_hours"], bins=30)
@@ -122,6 +154,9 @@ plt.ylabel("Number of Cases")
 save_plot("histogram_case_durations.png")
 
 
+# =========================
+# 10. Histogram of events per case
+# =========================
 
 plt.figure(figsize=(8, 5))
 plt.hist(case_stats["events_per_case"], bins=30)
@@ -131,9 +166,12 @@ plt.ylabel("Number of Cases")
 save_plot("histogram_events_per_case.png")
 
 
+# =========================
+# 11. Start activity distribution
+# =========================
 
 start_activities = (
-    df_filtered
+    df
     .groupby("case:concept:name")
     .first()["concept:name"]
     .value_counts()
@@ -147,9 +185,12 @@ plt.ylabel("Start Activity")
 save_plot("start_activity_distribution.png")
 
 
+# =========================
+# 12. End activity distribution
+# =========================
 
 end_activities = (
-    df_filtered
+    df
     .groupby("case:concept:name")
     .last()["concept:name"]
     .value_counts()
@@ -163,9 +204,12 @@ plt.ylabel("End Activity")
 save_plot("end_activity_distribution.png")
 
 
+# =========================
+# 13. Top 10 variants
+# =========================
 
 variants = (
-    df_filtered
+    df
     .groupby("case:concept:name")["concept:name"]
     .apply(lambda x: " → ".join(x))
 )
@@ -180,6 +224,9 @@ plt.ylabel("Variant")
 save_plot("top_10_most_common_variants.png")
 
 
+# =========================
+# 14. Duration percentiles
+# =========================
 
 duration_percentiles = case_stats["case_duration_hours"].quantile([
     0.00, 0.05, 0.25, 0.50, 0.75, 0.95, 1.00
@@ -191,6 +238,9 @@ duration_percentiles.to_csv(
 )
 
 
+# =========================
+# 15. Event-count percentiles
+# =========================
 
 event_count_percentiles = case_stats["events_per_case"].quantile([
     0.00, 0.05, 0.25, 0.50, 0.75, 0.95, 1.00
@@ -202,8 +252,12 @@ event_count_percentiles.to_csv(
 )
 
 
+# =========================
+# 16. Activity percentages
+# =========================
+
 activity_percentage = (
-    df_filtered["concept:name"]
+    df["concept:name"]
     .value_counts(normalize=True)
     .mul(100)
     .round(2)
@@ -213,5 +267,6 @@ activity_percentage.to_csv(
     os.path.join(output_folder, "activity_frequency_percentage.csv"),
     header=["percentage"]
 )
+
 
 print(f"\nAll diagrams and statistics saved in folder: {output_folder}")
