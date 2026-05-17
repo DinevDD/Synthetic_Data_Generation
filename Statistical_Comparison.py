@@ -40,18 +40,14 @@ def load_original_xes(path):
 def load_synthetic_csv(path):
     df = pd.read_csv(path)
 
-    df = df.rename(columns={
-        "Case ID": "case:concept:name",
-        "Activity": "concept:name",
-        "Timestamp": "time:timestamp",
-        "Group": "org:group",
-        "Lifecycle": "lifecycle:transition"
-    })
+    print(f"\nLoading synthetic CSV: {path}")
+    print(f"Raw rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
 
     required_columns = [
-        "case:concept:name",
-        "concept:name",
-        "time:timestamp"
+        "Case ID",
+        "Activity",
+        "Timestamp"
     ]
 
     missing_columns = [
@@ -65,15 +61,121 @@ def load_synthetic_csv(path):
             f"Available columns are: {list(df.columns)}"
         )
 
-    df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
-    df = df.sort_values(["case:concept:name", "time:timestamp"])
+    df["Timestamp"] = pd.to_datetime(
+        df["Timestamp"],
+        errors="coerce"
+    )
 
-    return df
+    if df["Timestamp"].isna().any():
+        bad_rows = df[df["Timestamp"].isna()]
+        raise ValueError(
+            f"Some timestamps could not be parsed:\n{bad_rows}"
+        )
+
+    event_rows = []
+
+    for _, row in df.iterrows():
+        case_id = row["Case ID"]
+        base_timestamp = row["Timestamp"]
+        group = row.get("Group", None)
+        lifecycle = row.get("Lifecycle", "complete")
+
+        activities = [
+            activity.strip()
+            for activity in str(row["Activity"]).split("/")
+            if activity.strip()
+        ]
+
+        for idx, activity in enumerate(activities):
+            event_rows.append({
+                "case:concept:name": case_id,
+                "concept:name": activity,
+                "time:timestamp": base_timestamp + pd.Timedelta(seconds=idx),
+                "org:group": group,
+                "lifecycle:transition": lifecycle
+            })
+
+    expanded_df = pd.DataFrame(event_rows)
+
+    expanded_df["time:timestamp"] = pd.to_datetime(
+        expanded_df["time:timestamp"],
+        utc=True,
+        errors="coerce"
+    )
+
+    expanded_df = expanded_df.sort_values(
+        ["case:concept:name", "time:timestamp"]
+    )
+
+    print(f"Expanded rows: {len(expanded_df)}")
+    print(f"Traces: {expanded_df['case:concept:name'].nunique()}")
+    print(f"Events: {len(expanded_df)}")
+    print(f"Activities: {sorted(expanded_df['concept:name'].unique())}")
+
+    return expanded_df
 
 
 original_df = load_original_xes(original_path)
 synthetic_df = load_synthetic_csv(synthetic_path)
 
+# =========================
+# 4. Load already mined models
+# =========================
+
+# IMPORTANT:
+# DFG should be saved as .dfg, not .xml
+original_dfg_path = "pm4py_outputs_inductive/discovery/dfg.dfg"
+synthetic_dfg_path = "pm4py_outputs_inductive/discovery_synthetic/dfg.dfg"
+
+original_petri_path = "pm4py_outputs_inductive/discovery/petri_net.pnml"
+synthetic_petri_path = "pm4py_outputs_inductive/discovery_synthetic/petri_net.pnml"
+
+# Process tree should be saved as .ptml, not .txt
+original_tree_path = "pm4py_outputs_inductive/discovery/process_tree.ptml"
+synthetic_tree_path = "pm4py_outputs_inductive/discovery_synthetic/process_tree.ptml"
+
+original_bpmn_path = "pm4py_outputs_inductive/discovery/process_model.bpmn"
+synthetic_bpmn_path = "pm4py_outputs_inductive/discovery_synthetic/process_model.bpmn"
+
+
+# Load DFGs
+original_dfg, original_start_activities, original_end_activities = pm4py.read_dfg(
+    original_dfg_path
+)
+
+synthetic_dfg, synthetic_start_activities, synthetic_end_activities = pm4py.read_dfg(
+    synthetic_dfg_path
+)
+
+
+# Load Petri nets
+original_net, original_im, original_fm = pm4py.read_pnml(
+    original_petri_path
+)
+
+synthetic_net, synthetic_im, synthetic_fm = pm4py.read_pnml(
+    synthetic_petri_path
+)
+
+
+# Load process trees
+original_tree = pm4py.read_ptml(
+    original_tree_path
+)
+
+synthetic_tree = pm4py.read_ptml(
+    synthetic_tree_path
+)
+
+
+# Load BPMN models
+original_bpmn = pm4py.read_bpmn(
+    original_bpmn_path
+)
+
+synthetic_bpmn = pm4py.read_bpmn(
+    synthetic_bpmn_path
+)
 
 # =========================
 # 4. Activity distribution
@@ -161,25 +263,40 @@ case_duration_wasserstein = wasserstein_distance(
 # 8. DFG distribution
 # =========================
 
-def get_dfg_distribution(df):
-    dfg_edges = []
+# =========================
+# DFG similarity using already mined DFGs
+# =========================
 
-    for _, case in df.groupby("case:concept:name"):
-        case = case.sort_values("time:timestamp")
-        activities = case["concept:name"].tolist()
 
-        for i in range(len(activities) - 1):
-            edge = (activities[i], activities[i + 1])
-            dfg_edges.append(edge)
 
-    if len(dfg_edges) == 0:
+
+def normalize_dfg(dfg):
+    """
+    Converts a mined DFG into a normalized frequency distribution.
+
+    Expected DFG format:
+    {
+        ("Activity A", "Activity B"): count,
+        ("Activity B", "Activity C"): count,
+        ...
+    }
+    """
+
+    if len(dfg) == 0:
         return pd.Series(dtype=float)
 
-    return pd.Series(dfg_edges).value_counts(normalize=True)
+    dfg_series = pd.Series(dfg, dtype=float)
+
+    total = dfg_series.sum()
+
+    if total == 0:
+        return pd.Series(dtype=float)
+
+    return dfg_series / total
 
 
-original_dfg_dist = get_dfg_distribution(original_df)
-synthetic_dfg_dist = get_dfg_distribution(synthetic_df)
+original_dfg_dist = normalize_dfg(original_dfg)
+synthetic_dfg_dist = normalize_dfg(synthetic_dfg)
 
 all_dfg_edges = sorted(
     set(original_dfg_dist.index)
@@ -204,10 +321,6 @@ dfg_cosine_similarity = cosine_similarity(
 )[0][0]
 
 
-# =========================
-# 9. Extra DFG overlap metrics
-# =========================
-
 original_dfg_edges = set(original_dfg_dist.index)
 synthetic_dfg_edges = set(synthetic_dfg_dist.index)
 
@@ -229,6 +342,153 @@ dfg_edge_extra_synthetic_ratio = (
     if len(synthetic_dfg_edges) > 0 else 0
 )
 
+# =========================
+# Petri net structural comparison
+# =========================
+
+def get_petri_net_structure(net):
+    places = {p.name for p in net.places}
+
+    transitions = {
+        t.label for t in net.transitions
+        if t.label is not None
+    }
+
+    silent_transitions = {
+        t.name for t in net.transitions
+        if t.label is None
+    }
+
+    arcs = {
+        (arc.source.name, arc.target.name)
+        for arc in net.arcs
+    }
+
+    return places, transitions, silent_transitions, arcs
+
+
+def jaccard_similarity(set_a, set_b):
+    union = set_a | set_b
+
+    if len(union) == 0:
+        return 1.0
+
+    return len(set_a & set_b) / len(union)
+
+
+original_places, original_transitions, original_silent, original_arcs = get_petri_net_structure(original_net)
+synthetic_places, synthetic_transitions, synthetic_silent, synthetic_arcs = get_petri_net_structure(synthetic_net)
+
+petri_transition_jaccard = jaccard_similarity(
+    original_transitions,
+    synthetic_transitions
+)
+
+petri_arc_jaccard = jaccard_similarity(
+    original_arcs,
+    synthetic_arcs
+)
+
+petri_place_count_difference = abs(
+    len(original_places) - len(synthetic_places)
+)
+
+petri_transition_count_difference = abs(
+    len(original_transitions) - len(synthetic_transitions)
+)
+
+petri_arc_count_difference = abs(
+    len(original_arcs) - len(synthetic_arcs)
+)
+
+# =========================
+# Process tree structural comparison
+# =========================
+
+def get_process_tree_labels_and_operators(tree):
+    labels = []
+    operators = []
+
+    def visit(node):
+        if node.label is not None:
+            labels.append(node.label)
+
+        if node.operator is not None:
+            operators.append(str(node.operator))
+
+        for child in node.children:
+            visit(child)
+
+    visit(tree)
+
+    return labels, operators
+
+
+original_tree_labels, original_tree_operators = get_process_tree_labels_and_operators(original_tree)
+synthetic_tree_labels, synthetic_tree_operators = get_process_tree_labels_and_operators(synthetic_tree)
+
+process_tree_label_jaccard = jaccard_similarity(
+    set(original_tree_labels),
+    set(synthetic_tree_labels)
+)
+
+process_tree_operator_jaccard = jaccard_similarity(
+    set(original_tree_operators),
+    set(synthetic_tree_operators)
+)
+
+process_tree_size_difference = abs(
+    len(original_tree_labels) + len(original_tree_operators)
+    - len(synthetic_tree_labels) - len(synthetic_tree_operators)
+)
+
+# =========================
+# BPMN structural comparison
+# =========================
+
+def get_bpmn_structure(bpmn_graph):
+    nodes = set()
+    activities = set()
+    flows = set()
+
+    for node in bpmn_graph.get_nodes():
+        nodes.add(str(node))
+
+        if hasattr(node, "get_name"):
+            name = node.get_name()
+            if name is not None:
+                activities.add(name)
+
+    for flow in bpmn_graph.get_flows():
+        source = str(flow.get_source())
+        target = str(flow.get_target())
+        flows.add((source, target))
+
+    return nodes, activities, flows
+
+
+original_bpmn_nodes, original_bpmn_activities, original_bpmn_flows = get_bpmn_structure(original_bpmn)
+synthetic_bpmn_nodes, synthetic_bpmn_activities, synthetic_bpmn_flows = get_bpmn_structure(synthetic_bpmn)
+
+bpmn_activity_jaccard = jaccard_similarity(
+    original_bpmn_activities,
+    synthetic_bpmn_activities
+)
+
+bpmn_flow_jaccard = jaccard_similarity(
+    original_bpmn_flows,
+    synthetic_bpmn_flows
+)
+
+bpmn_node_count_difference = abs(
+    len(original_bpmn_nodes) - len(synthetic_bpmn_nodes)
+)
+
+bpmn_flow_count_difference = abs(
+    len(original_bpmn_flows) - len(synthetic_bpmn_flows)
+)
+
+
 
 # =========================
 # 10. Results table
@@ -242,7 +502,22 @@ results = pd.DataFrame({
         "DFG edge coverage of original",
         "Extra synthetic DFG edge ratio",
         "Wasserstein distance of case durations in hours",
-        "Jensen-Shannon divergence of event distribution"
+        "Jensen-Shannon divergence of event distribution",
+
+        "Petri net transition Jaccard similarity",
+        "Petri net arc Jaccard similarity",
+        "Petri net place count difference",
+        "Petri net transition count difference",
+        "Petri net arc count difference",
+
+        "Process tree activity-label Jaccard similarity",
+        "Process tree operator Jaccard similarity",
+        "Process tree size difference",
+
+        "BPMN activity Jaccard similarity",
+        "BPMN flow Jaccard similarity",
+        "BPMN node count difference",
+        "BPMN flow count difference"
     ],
     "Value": [
         activity_cosine_similarity,
@@ -251,7 +526,22 @@ results = pd.DataFrame({
         dfg_edge_coverage_original,
         dfg_edge_extra_synthetic_ratio,
         case_duration_wasserstein,
-        js_divergence
+        js_divergence,
+
+        petri_transition_jaccard,
+        petri_arc_jaccard,
+        petri_place_count_difference,
+        petri_transition_count_difference,
+        petri_arc_count_difference,
+
+        process_tree_label_jaccard,
+        process_tree_operator_jaccard,
+        process_tree_size_difference,
+
+        bpmn_activity_jaccard,
+        bpmn_flow_jaccard,
+        bpmn_node_count_difference,
+        bpmn_flow_count_difference
     ]
 })
 

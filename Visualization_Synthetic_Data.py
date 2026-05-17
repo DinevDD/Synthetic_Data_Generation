@@ -3,26 +3,82 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# =========================
+## =========================
 # 1. Load CSV event log
 # =========================
 
-df = pd.read_csv("Data/data.csv")
+raw_df = pd.read_csv("Data/data.csv")
 
-# Rename your CSV columns to PM4Py-style names
-df = df.rename(columns={
-    "Case ID": "case:concept:name",
-    "Activity": "concept:name",
-    "Timestamp": "time:timestamp",
-    "Group": "org:group",
-    "Lifecycle": "lifecycle:transition"
-})
+print(f"Raw rows: {len(raw_df)}")
+print(f"Columns: {list(raw_df.columns)}")
 
-# Make sure timestamp is datetime
-df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+required_columns = [
+    "Case ID",
+    "Activity",
+    "Timestamp"
+]
 
-# Sort by case and timestamp
-df = df.sort_values(["case:concept:name", "time:timestamp"])
+missing_columns = [
+    col for col in required_columns
+    if col not in raw_df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        f"Missing columns in Data/data.csv: {missing_columns}\n"
+        f"Available columns are: {list(raw_df.columns)}"
+    )
+
+raw_df["Timestamp"] = pd.to_datetime(
+    raw_df["Timestamp"],
+    errors="coerce"
+)
+
+if raw_df["Timestamp"].isna().any():
+    bad_rows = raw_df[raw_df["Timestamp"].isna()]
+    raise ValueError(
+        f"Some timestamps could not be parsed:\n{bad_rows}"
+    )
+
+event_rows = []
+
+for _, row in raw_df.iterrows():
+    case_id = row["Case ID"]
+    base_timestamp = row["Timestamp"]
+    group = row.get("Group", None)
+    lifecycle = row.get("Lifecycle", "complete")
+
+    activities = [
+        activity.strip()
+        for activity in str(row["Activity"]).split("/")
+        if activity.strip()
+    ]
+
+    for idx, activity in enumerate(activities):
+        event_rows.append({
+            "case:concept:name": case_id,
+            "concept:name": activity,
+            "time:timestamp": base_timestamp + pd.Timedelta(seconds=idx),
+            "org:group": group,
+            "lifecycle:transition": lifecycle
+        })
+
+df = pd.DataFrame(event_rows)
+
+df["time:timestamp"] = pd.to_datetime(
+    df["time:timestamp"],
+    utc=True,
+    errors="coerce"
+)
+
+df = df.sort_values(
+    ["case:concept:name", "time:timestamp"]
+)
+
+print(f"Expanded rows: {len(df)}")
+print(f"Traces: {df['case:concept:name'].nunique()}")
+print(f"Events: {len(df)}")
+print(f"Activities: {sorted(df['concept:name'].unique())}")
 
 
 # =========================

@@ -80,58 +80,76 @@ def import_csv_log(path: str):
     print(f"    Raw rows  : {len(df)}")
     print(f"    Columns   : {list(df.columns)}")
 
-    # ── Auto-detect the three mandatory columns ───────────────────
-    CASE_ALIASES = [CSV_CASE_ID_COL,
-                    "case:concept:name", "case_id", "caseid",
-                    "Case ID", "CaseID", "trace", "Trace", "CaseId"]
-    ACT_ALIASES  = [CSV_ACTIVITY_COL,
-                    "concept:name", "activity", "Activity",
-                    "ActivityID", "task", "Task", "event", "Event",
-                    "action", "Action"]
-    TIME_ALIASES = [CSV_TIMESTAMP_COL,
-                    "time:timestamp", "timestamp", "Timestamp",
-                    "time", "Time", "datetime", "date", "Date",
-                    "start_time", "StartTime", "completeTime",
-                    "Complete Timestamp", "start timestamp"]
+    # Expected new format:
+    # Case ID, Activity, Timestamp, Group, Lifecycle
+    required_cols = ["Case ID", "Activity", "Timestamp"]
+    missing = [c for c in required_cols if c not in df.columns]
 
-    def pick_col(aliases, df_cols, label):
-        cols_lower = {c.lower(): c for c in df_cols}
-        for alias in aliases:
-            if alias in df_cols:
-                return alias
-            if alias.lower() in cols_lower:
-                return cols_lower[alias.lower()]
+    if missing:
         raise KeyError(
-            f"\nCould not auto-detect the {label} column.\n"
-            f"  Available columns : {list(df_cols)}\n"
-            f"  Set the matching name in the CONFIG section at the top of the script."
+            f"Missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
         )
 
-    case_col = pick_col(CASE_ALIASES, df.columns, "Case ID")
-    act_col  = pick_col(ACT_ALIASES,  df.columns, "Activity")
-    time_col = pick_col(TIME_ALIASES, df.columns, "Timestamp")
-    print(f"    Mapped    : case='{case_col}'  activity='{act_col}'  time='{time_col}'")
+    # Convert timestamp
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
 
-    # Rename to PM4Py standard names
-    rename_map = {}
-    if case_col != "case:concept:name": rename_map[case_col] = "case:concept:name"
-    if act_col  != "concept:name":      rename_map[act_col]  = "concept:name"
-    if time_col != "time:timestamp":    rename_map[time_col] = "time:timestamp"
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    if df["Timestamp"].isna().any():
+        bad_rows = df[df["Timestamp"].isna()]
+        raise ValueError(
+            f"Some timestamps could not be parsed:\n{bad_rows}"
+        )
 
-    df["time:timestamp"] = pd.to_datetime(df["time:timestamp"], utc=True, errors="coerce")
-    df = df.sort_values(["case:concept:name", "time:timestamp"])
+    # Explode trace-level rows into event-level rows
+    event_rows = []
+
+    for _, row in df.iterrows():
+        case_id = row["Case ID"]
+        base_timestamp = row["Timestamp"]
+        group = row.get("Group", None)
+        lifecycle = row.get("Lifecycle", "complete")
+
+        activities = [
+            act.strip()
+            for act in str(row["Activity"]).split("/")
+            if act.strip()
+        ]
+
+        for idx, activity in enumerate(activities):
+            event_rows.append({
+                "case:concept:name": case_id,
+                "concept:name": activity,
+                # Add seconds so activities have a clear order
+                "time:timestamp": base_timestamp + pd.Timedelta(seconds=idx),
+                "org:group": group,
+                "lifecycle:transition": lifecycle
+            })
+
+    event_df = pd.DataFrame(event_rows)
+
+    event_df["time:timestamp"] = pd.to_datetime(
+        event_df["time:timestamp"],
+        utc=True,
+        errors="coerce"
+    )
+
+    event_df = event_df.sort_values(
+        ["case:concept:name", "time:timestamp"]
+    )
+
+    print(f"    Expanded rows : {len(event_df)}")
+    print(f"    Traces        : {event_df['case:concept:name'].nunique()}")
+    print(f"    Events        : {len(event_df)}")
+    print(f"    Activities    : {sorted(event_df['concept:name'].unique())}")
 
     log = log_converter.apply(
-        df,
-        parameters={log_converter.Variants.TO_EVENT_LOG.value.Parameters.CASE_ID_KEY:
-                    "case:concept:name"},
+        event_df,
+        parameters={
+            log_converter.Variants.TO_EVENT_LOG.value.Parameters.CASE_ID_KEY:
+            "case:concept:name"
+        },
     )
-    print(f"    Traces    : {len(log)}")
-    print(f"    Events    : {sum(len(t) for t in log)}")
-    activities = set(e["concept:name"] for t in log for e in t)
-    print(f"    Activities: {sorted(activities)}")
+
     return log
 
 
