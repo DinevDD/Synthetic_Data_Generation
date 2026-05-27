@@ -7,78 +7,139 @@ import matplotlib.pyplot as plt
 # 1. Load CSV event log
 # =========================
 
-raw_df = pd.read_csv("Data/data.csv")
+def load_csv_event_log_dataframe(path: str) -> pd.DataFrame:
+    """
+    Loads synthetic CSV logs in either format:
 
-print(f"Raw rows: {len(raw_df)}")
-print(f"Columns: {list(raw_df.columns)}")
+    TS3/event-level format, preferred:
+        Case ID, Activity, Timestamp, Group, Lifecycle
+        1, ER Registration, 2014-02-26T10:15:03+00:00, A, complete
+        1, ER Triage,       2014-02-26T10:22:43+00:00, C, complete
 
-required_columns = [
-    "Case ID",
-    "Activity",
-    "Timestamp"
-]
+    TS1/case-level format, still supported:
+        Case ID, Activity, Timestamp, Group, Lifecycle
+        1, A/B/C, 2014-02-26T10:15:03+00:00, A, complete
 
-missing_columns = [
-    col for col in required_columns
-    if col not in raw_df.columns
-]
+    For TS3, timestamps/groups/lifecycles are preserved per event.
+    For TS1, activities are expanded and synthetic +1 second offsets are used.
+    """
+    df = pd.read_csv(path)
 
-if missing_columns:
-    raise ValueError(
-        f"Missing columns in Data/data.csv: {missing_columns}\n"
-        f"Available columns are: {list(raw_df.columns)}"
+    print(f"    Raw rows  : {len(df)}")
+    print(f"    Columns   : {list(df.columns)}")
+
+    required_cols = ["Case ID", "Activity", "Timestamp"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"Missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
+        )
+
+    if "Group" not in df.columns:
+        df["Group"] = None
+    if "Lifecycle" not in df.columns:
+        df["Lifecycle"] = "complete"
+
+    event_rows = []
+
+    for row_idx, row in df.iterrows():
+        case_id = str(row["Case ID"]).strip()
+
+        activities = [
+            part.strip()
+            for part in str(row["Activity"]).split("/")
+            if part.strip()
+        ]
+
+        timestamp_parts = [
+            part.strip()
+            for part in str(row["Timestamp"]).split("/")
+            if part.strip()
+        ]
+
+        group_parts = [
+            part.strip()
+            for part in str(row.get("Group", "")).split("/")
+            if part.strip()
+        ]
+
+        lifecycle_parts = [
+            part.strip()
+            for part in str(row.get("Lifecycle", "complete")).split("/")
+            if part.strip()
+        ]
+
+        if not activities:
+            raise ValueError(f"Row {row_idx} has no activity: {row.to_dict()}")
+
+        if not timestamp_parts:
+            raise ValueError(f"Row {row_idx} has no timestamp: {row.to_dict()}")
+
+        for idx, activity in enumerate(activities):
+            if len(timestamp_parts) == len(activities):
+                timestamp_value = timestamp_parts[idx]
+            elif len(timestamp_parts) == 1:
+                timestamp_value = pd.to_datetime(
+                    timestamp_parts[0],
+                    utc=True,
+                    errors="coerce"
+                ) + pd.Timedelta(seconds=idx)
+            else:
+                raise ValueError(
+                    f"Row {row_idx} has {len(activities)} activities but "
+                    f"{len(timestamp_parts)} timestamps. Use either one timestamp "
+                    "or one timestamp per activity."
+                )
+
+            if len(group_parts) == len(activities):
+                group_value = group_parts[idx]
+            elif len(group_parts) == 1:
+                group_value = group_parts[0]
+            else:
+                group_value = None
+
+            if len(lifecycle_parts) == len(activities):
+                lifecycle_value = lifecycle_parts[idx]
+            elif len(lifecycle_parts) == 1:
+                lifecycle_value = lifecycle_parts[0]
+            else:
+                lifecycle_value = "complete"
+
+            event_rows.append({
+                "case:concept:name": case_id,
+                "concept:name": activity,
+                "time:timestamp": timestamp_value,
+                "org:group": group_value,
+                "lifecycle:transition": lifecycle_value,
+            })
+
+    event_df = pd.DataFrame(event_rows)
+
+    event_df["time:timestamp"] = pd.to_datetime(
+        event_df["time:timestamp"],
+        utc=True,
+        errors="coerce"
     )
 
-raw_df["Timestamp"] = pd.to_datetime(
-    raw_df["Timestamp"],
-    errors="coerce"
-)
+    if event_df["time:timestamp"].isna().any():
+        bad_rows = event_df[event_df["time:timestamp"].isna()]
+        raise ValueError(f"Some timestamps could not be parsed:\n{bad_rows}")
 
-if raw_df["Timestamp"].isna().any():
-    bad_rows = raw_df[raw_df["Timestamp"].isna()]
-    raise ValueError(
-        f"Some timestamps could not be parsed:\n{bad_rows}"
-    )
+    event_df = event_df.sort_values(
+        ["case:concept:name", "time:timestamp"]
+    ).reset_index(drop=True)
 
-event_rows = []
+    print(f"    Event rows : {len(event_df)}")
+    print(f"    Traces     : {event_df['case:concept:name'].nunique()}")
+    print(f"    Events     : {len(event_df)}")
+    print(f"    Activities ({event_df['concept:name'].nunique()}): "
+          f"{sorted(event_df['concept:name'].dropna().unique())}")
 
-for _, row in raw_df.iterrows():
-    case_id = row["Case ID"]
-    base_timestamp = row["Timestamp"]
-    group = row.get("Group", None)
-    lifecycle = row.get("Lifecycle", "complete")
+    return event_df
 
-    activities = [
-        activity.strip()
-        for activity in str(row["Activity"]).split("/")
-        if activity.strip()
-    ]
 
-    for idx, activity in enumerate(activities):
-        event_rows.append({
-            "case:concept:name": case_id,
-            "concept:name": activity,
-            "time:timestamp": base_timestamp + pd.Timedelta(seconds=idx),
-            "org:group": group,
-            "lifecycle:transition": lifecycle
-        })
-
-df = pd.DataFrame(event_rows)
-
-df["time:timestamp"] = pd.to_datetime(
-    df["time:timestamp"],
-    utc=True,
-    errors="coerce"
-)
-
-df = df.sort_values(
-    ["case:concept:name", "time:timestamp"]
-)
-
-print(f"Expanded rows: {len(df)}")
-print(f"Traces: {df['case:concept:name'].nunique()}")
-print(f"Events: {len(df)}")
-print(f"Activities: {sorted(df['concept:name'].unique())}")
+df = load_csv_event_log_dataframe("Data/data.csv")
 
 
 # =========================

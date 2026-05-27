@@ -18,6 +18,8 @@ synthetic_path = "Data/data.csv"
 output_folder = "comparison_results"
 os.makedirs(output_folder, exist_ok=True)
 
+TOP_N = 20
+
 
 # =========================
 # 2. Load original XES.GZ log
@@ -27,7 +29,12 @@ def load_original_xes(path):
     log = pm4py.read_xes(path)
     df = pm4py.convert_to_dataframe(log)
 
-    df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+    df["time:timestamp"] = pd.to_datetime(
+        df["time:timestamp"],
+        utc=True,
+        errors="coerce"
+    )
+
     df = df.sort_values(["case:concept:name", "time:timestamp"])
 
     return df
@@ -37,201 +44,296 @@ def load_original_xes(path):
 # 3. Load synthetic CSV log
 # =========================
 
-def load_synthetic_csv(path):
+def load_csv_event_log_dataframe(path: str) -> pd.DataFrame:
+    """
+    Loads synthetic CSV logs in either format:
+
+    Event-level format:
+        Case ID, Activity, Timestamp, Group, Lifecycle
+        1, ER Registration, 2014-02-26T10:15:03+00:00, A, complete
+        1, ER Triage,       2014-02-26T10:22:43+00:00, C, complete
+
+    Case-level format:
+        Case ID, Activity, Timestamp, Group, Lifecycle
+        1, A/B/C, 2014-02-26T10:15:03+00:00, A, complete
+
+    For event-level data, timestamps/groups/lifecycles are preserved per event.
+    For case-level data, activities are expanded and +1 second offsets are used.
+    """
+
     df = pd.read_csv(path)
 
-    print(f"\nLoading synthetic CSV: {path}")
-    print(f"Raw rows: {len(df)}")
-    print(f"Columns: {list(df.columns)}")
+    print(f"    Raw rows  : {len(df)}")
+    print(f"    Columns   : {list(df.columns)}")
 
-    required_columns = [
-        "Case ID",
-        "Activity",
-        "Timestamp"
-    ]
+    required_cols = ["Case ID", "Activity", "Timestamp"]
+    missing = [c for c in required_cols if c not in df.columns]
 
-    missing_columns = [
-        col for col in required_columns
-        if col not in df.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"Missing columns in {path}: {missing_columns}\n"
-            f"Available columns are: {list(df.columns)}"
+    if missing:
+        raise KeyError(
+            f"Missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
         )
 
-    df["Timestamp"] = pd.to_datetime(
-        df["Timestamp"],
-        errors="coerce"
-    )
+    if "Group" not in df.columns:
+        df["Group"] = None
 
-    if df["Timestamp"].isna().any():
-        bad_rows = df[df["Timestamp"].isna()]
-        raise ValueError(
-            f"Some timestamps could not be parsed:\n{bad_rows}"
-        )
+    if "Lifecycle" not in df.columns:
+        df["Lifecycle"] = "complete"
 
     event_rows = []
 
-    for _, row in df.iterrows():
-        case_id = row["Case ID"]
-        base_timestamp = row["Timestamp"]
-        group = row.get("Group", None)
-        lifecycle = row.get("Lifecycle", "complete")
+    for row_idx, row in df.iterrows():
+        case_id = str(row["Case ID"]).strip()
 
         activities = [
-            activity.strip()
-            for activity in str(row["Activity"]).split("/")
-            if activity.strip()
+            part.strip()
+            for part in str(row["Activity"]).split("/")
+            if part.strip()
         ]
 
+        timestamp_parts = [
+            part.strip()
+            for part in str(row["Timestamp"]).split("/")
+            if part.strip()
+        ]
+
+        group_parts = [
+            part.strip()
+            for part in str(row.get("Group", "")).split("/")
+            if part.strip()
+        ]
+
+        lifecycle_parts = [
+            part.strip()
+            for part in str(row.get("Lifecycle", "complete")).split("/")
+            if part.strip()
+        ]
+
+        if not activities:
+            raise ValueError(f"Row {row_idx} has no activity: {row.to_dict()}")
+
+        if not timestamp_parts:
+            raise ValueError(f"Row {row_idx} has no timestamp: {row.to_dict()}")
+
         for idx, activity in enumerate(activities):
+            if len(timestamp_parts) == len(activities):
+                timestamp_value = timestamp_parts[idx]
+
+            elif len(timestamp_parts) == 1:
+                timestamp_value = (
+                    pd.to_datetime(
+                        timestamp_parts[0],
+                        utc=True,
+                        errors="coerce"
+                    )
+                    + pd.Timedelta(seconds=idx)
+                )
+
+            else:
+                raise ValueError(
+                    f"Row {row_idx} has {len(activities)} activities but "
+                    f"{len(timestamp_parts)} timestamps. Use either one timestamp "
+                    "or one timestamp per activity."
+                )
+
+            if len(group_parts) == len(activities):
+                group_value = group_parts[idx]
+            elif len(group_parts) == 1:
+                group_value = group_parts[0]
+            else:
+                group_value = None
+
+            if len(lifecycle_parts) == len(activities):
+                lifecycle_value = lifecycle_parts[idx]
+            elif len(lifecycle_parts) == 1:
+                lifecycle_value = lifecycle_parts[0]
+            else:
+                lifecycle_value = "complete"
+
             event_rows.append({
                 "case:concept:name": case_id,
                 "concept:name": activity,
-                "time:timestamp": base_timestamp + pd.Timedelta(seconds=idx),
-                "org:group": group,
-                "lifecycle:transition": lifecycle
+                "time:timestamp": timestamp_value,
+                "org:group": group_value,
+                "lifecycle:transition": lifecycle_value,
             })
 
-    expanded_df = pd.DataFrame(event_rows)
+    event_df = pd.DataFrame(event_rows)
 
-    expanded_df["time:timestamp"] = pd.to_datetime(
-        expanded_df["time:timestamp"],
+    event_df["time:timestamp"] = pd.to_datetime(
+        event_df["time:timestamp"],
         utc=True,
         errors="coerce"
     )
 
-    expanded_df = expanded_df.sort_values(
+    if event_df["time:timestamp"].isna().any():
+        bad_rows = event_df[event_df["time:timestamp"].isna()]
+        raise ValueError(f"Some timestamps could not be parsed:\n{bad_rows}")
+
+    event_df = event_df.sort_values(
         ["case:concept:name", "time:timestamp"]
+    ).reset_index(drop=True)
+
+    print(f"    Event rows : {len(event_df)}")
+    print(f"    Traces     : {event_df['case:concept:name'].nunique()}")
+    print(f"    Events     : {len(event_df)}")
+    print(
+        f"    Activities ({event_df['concept:name'].nunique()}): "
+        f"{sorted(event_df['concept:name'].dropna().unique())}"
     )
 
-    print(f"Expanded rows: {len(expanded_df)}")
-    print(f"Traces: {expanded_df['case:concept:name'].nunique()}")
-    print(f"Events: {len(expanded_df)}")
-    print(f"Activities: {sorted(expanded_df['concept:name'].unique())}")
-
-    return expanded_df
+    return event_df
 
 
-original_df = load_original_xes(original_path)
-synthetic_df = load_synthetic_csv(synthetic_path)
+def load_synthetic_csv(path):
+    print(f"\nLoading synthetic CSV: {path}")
+    return load_csv_event_log_dataframe(path)
+
 
 # =========================
-# 4. Load already mined models
+# 4. Helper functions
 # =========================
 
-# IMPORTANT:
-# DFG should be saved as .dfg, not .xml
-original_dfg_path = "pm4py_outputs_inductive/discovery/dfg.dfg"
-synthetic_dfg_path = "pm4py_outputs_inductive/discovery_synthetic/dfg.dfg"
+def jaccard_similarity(set_a, set_b):
+    union = set_a | set_b
 
-original_petri_path = "pm4py_outputs_inductive/discovery/petri_net.pnml"
-synthetic_petri_path = "pm4py_outputs_inductive/discovery_synthetic/petri_net.pnml"
+    if len(union) == 0:
+        return 1.0
 
-# Process tree should be saved as .ptml, not .txt
-original_tree_path = "pm4py_outputs_inductive/discovery/process_tree.ptml"
-synthetic_tree_path = "pm4py_outputs_inductive/discovery_synthetic/process_tree.ptml"
-
-original_bpmn_path = "pm4py_outputs_inductive/discovery/process_model.bpmn"
-synthetic_bpmn_path = "pm4py_outputs_inductive/discovery_synthetic/process_model.bpmn"
+    return len(set_a & set_b) / len(union)
 
 
-# Load DFGs
-original_dfg, original_start_activities, original_end_activities = pm4py.read_dfg(
-    original_dfg_path
-)
+def safe_cosine(vec_a, vec_b):
+    if np.sum(vec_a) == 0 or np.sum(vec_b) == 0:
+        return 0.0
 
-synthetic_dfg, synthetic_start_activities, synthetic_end_activities = pm4py.read_dfg(
-    synthetic_dfg_path
-)
+    return cosine_similarity([vec_a], [vec_b])[0][0]
 
 
-# Load Petri nets
-original_net, original_im, original_fm = pm4py.read_pnml(
-    original_petri_path
-)
+def safe_js_divergence(vec_a, vec_b):
+    if np.sum(vec_a) == 0 or np.sum(vec_b) == 0:
+        return 0.0
 
-synthetic_net, synthetic_im, synthetic_fm = pm4py.read_pnml(
-    synthetic_petri_path
-)
+    js_distance = jensenshannon(vec_a, vec_b, base=2)
 
-
-# Load process trees
-original_tree = pm4py.read_ptml(
-    original_tree_path
-)
-
-synthetic_tree = pm4py.read_ptml(
-    synthetic_tree_path
-)
+    return js_distance ** 2
 
 
-# Load BPMN models
-original_bpmn = pm4py.read_bpmn(
-    original_bpmn_path
-)
+def distribution_vectors(dist_a, dist_b):
+    """
+    Align two probability distributions over the same keys.
+    Missing values are filled with 0.
+    """
 
-synthetic_bpmn = pm4py.read_bpmn(
-    synthetic_bpmn_path
-)
+    all_keys = sorted(set(dist_a.index) | set(dist_b.index))
+
+    vec_a = dist_a.reindex(all_keys, fill_value=0).values
+    vec_b = dist_b.reindex(all_keys, fill_value=0).values
+
+    return all_keys, vec_a, vec_b
+
+
+def distribution_similarity_metrics(dist_a, dist_b):
+    """
+    Computes cosine similarity, Jensen-Shannon divergence,
+    and Jaccard similarity over distribution support.
+    """
+
+    all_keys, vec_a, vec_b = distribution_vectors(dist_a, dist_b)
+
+    support_a = set(dist_a[dist_a > 0].index)
+    support_b = set(dist_b[dist_b > 0].index)
+
+    return {
+        "keys": all_keys,
+        "vec_a": vec_a,
+        "vec_b": vec_b,
+        "cosine": safe_cosine(vec_a, vec_b),
+        "js_divergence": safe_js_divergence(vec_a, vec_b),
+        "jaccard": jaccard_similarity(support_a, support_b),
+    }
+
+
+def save_distribution_comparison(
+    keys,
+    vec_a,
+    vec_b,
+    key_column,
+    output_filename
+):
+    comparison = pd.DataFrame({
+        key_column: keys,
+        "original_percentage": vec_a * 100,
+        "synthetic_percentage": vec_b * 100,
+        "absolute_difference": np.abs(vec_a - vec_b) * 100
+    })
+
+    comparison = comparison.sort_values(
+        "absolute_difference",
+        ascending=False
+    )
+
+    comparison.to_csv(
+        os.path.join(output_folder, output_filename),
+        index=False
+    )
+
+    return comparison
+
+
+def summarize_numeric_series(series, name):
+    return {
+        f"{name}_mean": series.mean(),
+        f"{name}_median": series.median(),
+        f"{name}_std": series.std(),
+        f"{name}_min": series.min(),
+        f"{name}_max": series.max(),
+        f"{name}_q25": series.quantile(0.25),
+        f"{name}_q75": series.quantile(0.75),
+    }
+
 
 # =========================
-# 4. Activity distribution
+# 5. Distribution functions
 # =========================
 
 def get_activity_distribution(df):
     return df["concept:name"].value_counts(normalize=True)
 
 
-original_activity_dist = get_activity_distribution(original_df)
-synthetic_activity_dist = get_activity_distribution(synthetic_df)
+def get_final_event_distribution(df):
+    final_events = (
+        df.sort_values(["case:concept:name", "time:timestamp"])
+        .groupby("case:concept:name")
+        .tail(1)
+    )
 
-all_activities = sorted(
-    set(original_activity_dist.index)
-    | set(synthetic_activity_dist.index)
-)
-
-original_activity_vector = (
-    original_activity_dist
-    .reindex(all_activities, fill_value=0)
-    .values
-)
-
-synthetic_activity_vector = (
-    synthetic_activity_dist
-    .reindex(all_activities, fill_value=0)
-    .values
-)
+    return final_events["concept:name"].value_counts(normalize=True)
 
 
-# =========================
-# 5. Cosine similarity for event distribution
-# =========================
+def get_case_variants(df):
+    variants = (
+        df.sort_values(["case:concept:name", "time:timestamp"])
+        .groupby("case:concept:name")["concept:name"]
+        .apply(lambda events: tuple(events))
+    )
 
-activity_cosine_similarity = cosine_similarity(
-    [original_activity_vector],
-    [synthetic_activity_vector]
-)[0][0]
-
-
-# =========================
-# 6. Jensen-Shannon divergence for event distribution
-# =========================
-
-js_distance = jensenshannon(
-    original_activity_vector,
-    synthetic_activity_vector,
-    base=2
-)
-
-js_divergence = js_distance ** 2
+    return variants
 
 
-# =========================
-# 7. Case duration Wasserstein distance
-# =========================
+def get_case_variant_distribution(df):
+    variants = get_case_variants(df)
+
+    variant_dist = variants.value_counts(normalize=True)
+
+    variant_dist.index = [
+        " -> ".join(variant)
+        for variant in variant_dist.index
+    ]
+
+    return variant_dist
+
 
 def get_case_durations_hours(df):
     case_stats = (
@@ -250,6 +352,108 @@ def get_case_durations_hours(df):
     return case_durations
 
 
+def get_events_per_case(df):
+    return df.groupby("case:concept:name").size()
+
+
+def get_events_per_case_distribution(df):
+    events_per_case = get_events_per_case(df)
+
+    return events_per_case.value_counts(normalize=True).sort_index()
+
+
+# =========================
+# 6. Load logs
+# =========================
+
+print("\nLoading original XES log:")
+original_df = load_original_xes(original_path)
+
+synthetic_df = load_synthetic_csv(synthetic_path)
+
+
+# =========================
+# 7. Event/activity distribution
+# =========================
+
+original_activity_dist = get_activity_distribution(original_df)
+synthetic_activity_dist = get_activity_distribution(synthetic_df)
+
+activity_metrics = distribution_similarity_metrics(
+    original_activity_dist,
+    synthetic_activity_dist
+)
+
+activity_comparison = save_distribution_comparison(
+    activity_metrics["keys"],
+    activity_metrics["vec_a"],
+    activity_metrics["vec_b"],
+    "activity",
+    "activity_distribution_comparison.csv"
+)
+
+activity_comparison.head(TOP_N).to_csv(
+    os.path.join(output_folder, "top_activity_distribution_comparison.csv"),
+    index=False
+)
+
+
+# =========================
+# 8. Final event distribution
+# =========================
+
+original_final_event_dist = get_final_event_distribution(original_df)
+synthetic_final_event_dist = get_final_event_distribution(synthetic_df)
+
+final_event_metrics = distribution_similarity_metrics(
+    original_final_event_dist,
+    synthetic_final_event_dist
+)
+
+final_event_comparison = save_distribution_comparison(
+    final_event_metrics["keys"],
+    final_event_metrics["vec_a"],
+    final_event_metrics["vec_b"],
+    "final_event",
+    "final_event_distribution_comparison.csv"
+)
+
+final_event_comparison.head(TOP_N).to_csv(
+    os.path.join(output_folder, "top_final_event_distribution_comparison.csv"),
+    index=False
+)
+
+
+# =========================
+# 9. Case variant distribution
+# =========================
+
+original_variant_dist = get_case_variant_distribution(original_df)
+synthetic_variant_dist = get_case_variant_distribution(synthetic_df)
+
+variant_metrics = distribution_similarity_metrics(
+    original_variant_dist,
+    synthetic_variant_dist
+)
+
+variant_comparison = save_distribution_comparison(
+    variant_metrics["keys"],
+    variant_metrics["vec_a"],
+    variant_metrics["vec_b"],
+    "case_variant",
+    "case_variant_distribution_comparison.csv"
+)
+
+variant_comparison.head(TOP_N).to_csv(
+    os.path.join(output_folder, "top_case_variant_distribution_comparison.csv"),
+    index=False
+)
+
+
+# =========================
+# 10. Case duration comparison
+# =========================
+
 original_case_durations = get_case_durations_hours(original_df)
 synthetic_case_durations = get_case_durations_hours(synthetic_df)
 
@@ -257,354 +461,6 @@ case_duration_wasserstein = wasserstein_distance(
     original_case_durations,
     synthetic_case_durations
 )
-
-
-# =========================
-# 8. DFG distribution
-# =========================
-
-# =========================
-# DFG similarity using already mined DFGs
-# =========================
-
-
-
-
-def normalize_dfg(dfg):
-    """
-    Converts a mined DFG into a normalized frequency distribution.
-
-    Expected DFG format:
-    {
-        ("Activity A", "Activity B"): count,
-        ("Activity B", "Activity C"): count,
-        ...
-    }
-    """
-
-    if len(dfg) == 0:
-        return pd.Series(dtype=float)
-
-    dfg_series = pd.Series(dfg, dtype=float)
-
-    total = dfg_series.sum()
-
-    if total == 0:
-        return pd.Series(dtype=float)
-
-    return dfg_series / total
-
-
-original_dfg_dist = normalize_dfg(original_dfg)
-synthetic_dfg_dist = normalize_dfg(synthetic_dfg)
-
-all_dfg_edges = sorted(
-    set(original_dfg_dist.index)
-    | set(synthetic_dfg_dist.index)
-)
-
-original_dfg_vector = (
-    original_dfg_dist
-    .reindex(all_dfg_edges, fill_value=0)
-    .values
-)
-
-synthetic_dfg_vector = (
-    synthetic_dfg_dist
-    .reindex(all_dfg_edges, fill_value=0)
-    .values
-)
-
-dfg_cosine_similarity = cosine_similarity(
-    [original_dfg_vector],
-    [synthetic_dfg_vector]
-)[0][0]
-
-
-original_dfg_edges = set(original_dfg_dist.index)
-synthetic_dfg_edges = set(synthetic_dfg_dist.index)
-
-common_dfg_edges = original_dfg_edges & synthetic_dfg_edges
-all_edges = original_dfg_edges | synthetic_dfg_edges
-
-dfg_edge_jaccard_similarity = (
-    len(common_dfg_edges) / len(all_edges)
-    if len(all_edges) > 0 else 0
-)
-
-dfg_edge_coverage_original = (
-    len(common_dfg_edges) / len(original_dfg_edges)
-    if len(original_dfg_edges) > 0 else 0
-)
-
-dfg_edge_extra_synthetic_ratio = (
-    len(synthetic_dfg_edges - original_dfg_edges) / len(synthetic_dfg_edges)
-    if len(synthetic_dfg_edges) > 0 else 0
-)
-
-# =========================
-# Petri net structural comparison
-# =========================
-
-def get_petri_net_structure(net):
-    places = {p.name for p in net.places}
-
-    transitions = {
-        t.label for t in net.transitions
-        if t.label is not None
-    }
-
-    silent_transitions = {
-        t.name for t in net.transitions
-        if t.label is None
-    }
-
-    arcs = {
-        (arc.source.name, arc.target.name)
-        for arc in net.arcs
-    }
-
-    return places, transitions, silent_transitions, arcs
-
-
-def jaccard_similarity(set_a, set_b):
-    union = set_a | set_b
-
-    if len(union) == 0:
-        return 1.0
-
-    return len(set_a & set_b) / len(union)
-
-
-original_places, original_transitions, original_silent, original_arcs = get_petri_net_structure(original_net)
-synthetic_places, synthetic_transitions, synthetic_silent, synthetic_arcs = get_petri_net_structure(synthetic_net)
-
-petri_transition_jaccard = jaccard_similarity(
-    original_transitions,
-    synthetic_transitions
-)
-
-petri_arc_jaccard = jaccard_similarity(
-    original_arcs,
-    synthetic_arcs
-)
-
-petri_place_count_difference = abs(
-    len(original_places) - len(synthetic_places)
-)
-
-petri_transition_count_difference = abs(
-    len(original_transitions) - len(synthetic_transitions)
-)
-
-petri_arc_count_difference = abs(
-    len(original_arcs) - len(synthetic_arcs)
-)
-
-# =========================
-# Process tree structural comparison
-# =========================
-
-def get_process_tree_labels_and_operators(tree):
-    labels = []
-    operators = []
-
-    def visit(node):
-        if node.label is not None:
-            labels.append(node.label)
-
-        if node.operator is not None:
-            operators.append(str(node.operator))
-
-        for child in node.children:
-            visit(child)
-
-    visit(tree)
-
-    return labels, operators
-
-
-original_tree_labels, original_tree_operators = get_process_tree_labels_and_operators(original_tree)
-synthetic_tree_labels, synthetic_tree_operators = get_process_tree_labels_and_operators(synthetic_tree)
-
-process_tree_label_jaccard = jaccard_similarity(
-    set(original_tree_labels),
-    set(synthetic_tree_labels)
-)
-
-process_tree_operator_jaccard = jaccard_similarity(
-    set(original_tree_operators),
-    set(synthetic_tree_operators)
-)
-
-process_tree_size_difference = abs(
-    len(original_tree_labels) + len(original_tree_operators)
-    - len(synthetic_tree_labels) - len(synthetic_tree_operators)
-)
-
-# =========================
-# BPMN structural comparison
-# =========================
-
-def get_bpmn_structure(bpmn_graph):
-    nodes = set()
-    activities = set()
-    flows = set()
-
-    for node in bpmn_graph.get_nodes():
-        nodes.add(str(node))
-
-        if hasattr(node, "get_name"):
-            name = node.get_name()
-            if name is not None:
-                activities.add(name)
-
-    for flow in bpmn_graph.get_flows():
-        source = str(flow.get_source())
-        target = str(flow.get_target())
-        flows.add((source, target))
-
-    return nodes, activities, flows
-
-
-original_bpmn_nodes, original_bpmn_activities, original_bpmn_flows = get_bpmn_structure(original_bpmn)
-synthetic_bpmn_nodes, synthetic_bpmn_activities, synthetic_bpmn_flows = get_bpmn_structure(synthetic_bpmn)
-
-bpmn_activity_jaccard = jaccard_similarity(
-    original_bpmn_activities,
-    synthetic_bpmn_activities
-)
-
-bpmn_flow_jaccard = jaccard_similarity(
-    original_bpmn_flows,
-    synthetic_bpmn_flows
-)
-
-bpmn_node_count_difference = abs(
-    len(original_bpmn_nodes) - len(synthetic_bpmn_nodes)
-)
-
-bpmn_flow_count_difference = abs(
-    len(original_bpmn_flows) - len(synthetic_bpmn_flows)
-)
-
-
-
-# =========================
-# 10. Results table
-# =========================
-
-results = pd.DataFrame({
-    "Metric": [
-        "Cosine similarity of event distribution",
-        "DFG cosine similarity",
-        "DFG edge Jaccard similarity",
-        "DFG edge coverage of original",
-        "Extra synthetic DFG edge ratio",
-        "Wasserstein distance of case durations in hours",
-        "Jensen-Shannon divergence of event distribution",
-
-        "Petri net transition Jaccard similarity",
-        "Petri net arc Jaccard similarity",
-        "Petri net place count difference",
-        "Petri net transition count difference",
-        "Petri net arc count difference",
-
-        "Process tree activity-label Jaccard similarity",
-        "Process tree operator Jaccard similarity",
-        "Process tree size difference",
-
-        "BPMN activity Jaccard similarity",
-        "BPMN flow Jaccard similarity",
-        "BPMN node count difference",
-        "BPMN flow count difference"
-    ],
-    "Value": [
-        activity_cosine_similarity,
-        dfg_cosine_similarity,
-        dfg_edge_jaccard_similarity,
-        dfg_edge_coverage_original,
-        dfg_edge_extra_synthetic_ratio,
-        case_duration_wasserstein,
-        js_divergence,
-
-        petri_transition_jaccard,
-        petri_arc_jaccard,
-        petri_place_count_difference,
-        petri_transition_count_difference,
-        petri_arc_count_difference,
-
-        process_tree_label_jaccard,
-        process_tree_operator_jaccard,
-        process_tree_size_difference,
-
-        bpmn_activity_jaccard,
-        bpmn_flow_jaccard,
-        bpmn_node_count_difference,
-        bpmn_flow_count_difference
-    ]
-})
-
-results.to_csv(
-    os.path.join(output_folder, "comparison_metrics.csv"),
-    index=False
-)
-
-print("\nComparison metrics:")
-print(results.to_string(index=False))
-
-
-# =========================
-# 11. Save detailed activity comparison
-# =========================
-
-activity_comparison = pd.DataFrame({
-    "activity": all_activities,
-    "original_percentage": original_activity_vector * 100,
-    "synthetic_percentage": synthetic_activity_vector * 100,
-    "absolute_difference": np.abs(
-        original_activity_vector - synthetic_activity_vector
-    ) * 100
-})
-
-activity_comparison = activity_comparison.sort_values(
-    "absolute_difference",
-    ascending=False
-)
-
-activity_comparison.to_csv(
-    os.path.join(output_folder, "activity_distribution_comparison.csv"),
-    index=False
-)
-
-
-# =========================
-# 12. Save detailed DFG comparison
-# =========================
-
-dfg_comparison = pd.DataFrame({
-    "dfg_edge": [f"{edge[0]} -> {edge[1]}" for edge in all_dfg_edges],
-    "original_percentage": original_dfg_vector * 100,
-    "synthetic_percentage": synthetic_dfg_vector * 100,
-    "absolute_difference": np.abs(
-        original_dfg_vector - synthetic_dfg_vector
-    ) * 100
-})
-
-dfg_comparison = dfg_comparison.sort_values(
-    "absolute_difference",
-    ascending=False
-)
-
-dfg_comparison.to_csv(
-    os.path.join(output_folder, "dfg_distribution_comparison.csv"),
-    index=False
-)
-
-
-# =========================
-# 13. Save case duration comparison
-# =========================
 
 duration_comparison = pd.DataFrame({
     "original_case_duration_hours": pd.Series(original_case_durations.values),
@@ -616,5 +472,127 @@ duration_comparison.to_csv(
     index=False
 )
 
+
+# =========================
+# 11. Events per case comparison
+# =========================
+
+original_events_per_case = get_events_per_case(original_df)
+synthetic_events_per_case = get_events_per_case(synthetic_df)
+
+original_events_per_case_dist = get_events_per_case_distribution(original_df)
+synthetic_events_per_case_dist = get_events_per_case_distribution(synthetic_df)
+
+events_per_case_metrics = distribution_similarity_metrics(
+    original_events_per_case_dist,
+    synthetic_events_per_case_dist
+)
+
+events_per_case_wasserstein = wasserstein_distance(
+    original_events_per_case,
+    synthetic_events_per_case
+)
+
+events_per_case_comparison = save_distribution_comparison(
+    events_per_case_metrics["keys"],
+    events_per_case_metrics["vec_a"],
+    events_per_case_metrics["vec_b"],
+    "events_per_case",
+    "events_per_case_distribution_comparison.csv"
+)
+
+
+# =========================
+# 12. Summary statistics
+# =========================
+
+case_duration_summary = {
+    **summarize_numeric_series(
+        original_case_durations,
+        "original_case_duration_hours"
+    ),
+    **summarize_numeric_series(
+        synthetic_case_durations,
+        "synthetic_case_duration_hours"
+    ),
+}
+
+events_per_case_summary = {
+    **summarize_numeric_series(
+        original_events_per_case,
+        "original_events_per_case"
+    ),
+    **summarize_numeric_series(
+        synthetic_events_per_case,
+        "synthetic_events_per_case"
+    ),
+}
+
+summary_statistics = pd.DataFrame(
+    list(case_duration_summary.items())
+    + list(events_per_case_summary.items()),
+    columns=["Statistic", "Value"]
+)
+
+summary_statistics.to_csv(
+    os.path.join(output_folder, "case_duration_and_length_summary.csv"),
+    index=False
+)
+
+
+# =========================
+# 13. Final metrics table
+# =========================
+
+results = pd.DataFrame({
+    "Metric": [
+        "Cosine similarity of event distribution",
+        "Jaccard similarity of event distribution",
+        "Jensen-Shannon divergence of event distribution",
+
+        "Final event cosine similarity",
+        "Final event Jaccard similarity",
+        "Final event Jensen-Shannon divergence",
+
+        "Case variant cosine similarity",
+        "Case variant Jaccard similarity",
+        "Case variant Jensen-Shannon divergence",
+
+        "Wasserstein distance of case durations in hours",
+
+        "Events-per-case cosine similarity",
+        "Events-per-case Jaccard similarity",
+        "Events-per-case Jensen-Shannon divergence",
+        "Events-per-case Wasserstein distance",
+    ],
+    "Value": [
+        activity_metrics["cosine"],
+        activity_metrics["jaccard"],
+        activity_metrics["js_divergence"],
+
+        final_event_metrics["cosine"],
+        final_event_metrics["jaccard"],
+        final_event_metrics["js_divergence"],
+
+        variant_metrics["cosine"],
+        variant_metrics["jaccard"],
+        variant_metrics["js_divergence"],
+
+        case_duration_wasserstein,
+
+        events_per_case_metrics["cosine"],
+        events_per_case_metrics["jaccard"],
+        events_per_case_metrics["js_divergence"],
+        events_per_case_wasserstein,
+    ]
+})
+
+results.to_csv(
+    os.path.join(output_folder, "comparison_metrics.csv"),
+    index=False
+)
+
+print("\nComparison metrics:")
+print(results.to_string(index=False))
 
 print(f"\nAll comparison results saved in folder: {output_folder}")
